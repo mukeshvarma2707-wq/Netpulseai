@@ -1,19 +1,33 @@
 """
 src/ingestion/cdr_loader.py
 
-Loads the Milan telecom ACTIVITY dataset (sms-call-internet-mi-*.csv files),
-one day at a time, summing across CountryCode WITHIN each file before
-combining across days.
+Loads the FULL Milan Grid CDR dataset from Harvard Dataverse - real,
+raw, tab-separated .txt files at native 10-minute granularity - and
+aggregates them into the same hourly format the rest of this pipeline
+was built and validated against.
 
-WHY THIS MATTERS (memory safety): each daily file contains multiple rows per
-(CellID, timestamp) — one per country code active in that cell that
-interval. Loading all 7 days of raw, un-aggregated rows into memory at once
-before doing anything with them is unnecessarily heavy on a constrained
-laptop. Since we already know we need to sum across country codes eventually
-(to get each cell's TOTAL activity per interval), doing that sum per-file,
-immediately after loading it, means we only ever hold one day's raw data in
-memory at a time — the combined result across all 7 days is much smaller
-because it's already aggregated.
+REAL FORMAT, CONFIRMED DIRECTLY FROM THE RAW FILES (not assumed):
+    - Tab-separated, NO header row
+    - 8 fields per row: CellID, timestamp_ms, countrycode, smsin,
+      smsout, callin, callout, internet
+    - timestamp_ms is milliseconds since Unix epoch, UTC - but Milan's
+      local time (what the filenames and everything downstream is
+      labeled in) is UTC+1 in this period, so it must be explicitly
+      converted via the Europe/Rome timezone, not just parsed naively.
+    - Empty fields mean "no activity that interval" - treated as 0 when
+      summing, not as missing data.
+    - Real interval confirmed: 10 minutes (the earlier Kaggle CSV mirror
+      of this same dataset had already pre-aggregated this to hourly).
+
+DESIGN DECISION (flagging explicitly): every downstream script in this
+pipeline (congestion thresholds, forecasting, diagnosis, the solver) was
+built and validated at HOURLY granularity. Rather than redesign all of
+that for native 10-minute data - a large rewrite for uncertain benefit,
+given our actual use case is hour-ahead capacity planning, not
+minute-level reaction - this loader aggregates the raw 10-minute data
+UP to hourly during ingestion, exactly reproducing what the Kaggle
+mirror had already done. Every downstream script keeps working
+unchanged.
 
 REQUIREMENTS:
     pip install pandas pyarrow
@@ -27,113 +41,118 @@ from pathlib import Path
 import pandas as pd
 
 RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
-ACTIVITY_PATTERN = "sms-call-internet-mi-*.csv"
 
-# Columns we expect to sum across country codes. If your real file has
-# different column names, this script will tell you exactly what it found
-# so we can adjust — it does NOT silently guess.
-ACTIVITY_COLS_GUESS = ["smsin", "smsout", "callin", "callout", "internet"]
+COLUMN_NAMES = ["CellID", "timestamp_ms", "countrycode", "smsin", "smsout", "callin", "callout", "internet"]
+ACTIVITY_COLS = ["smsin", "smsout", "callin", "callout", "internet"]
 
 
-def find_activity_files() -> list[Path]:
-    files = sorted(RAW_DIR.glob(ACTIVITY_PATTERN))
+def find_activity_files() -> list:
+    files = sorted(RAW_DIR.glob("sms-call-internet-mi-*.txt"))
+    if not files:
+        files = sorted(RAW_DIR.glob("sms-call-internet-mi-*.csv"))
     if not files:
         raise FileNotFoundError(
-            f"No files matching '{ACTIVITY_PATTERN}' found in {RAW_DIR}. "
-            f"Files currently in that folder: {[p.name for p in RAW_DIR.glob('*.csv')]}"
+            f"No files matching 'sms-call-internet-mi-*.txt' or '*.csv' found in {RAW_DIR}. "
+            f"Files currently in that folder: {[f.name for f in RAW_DIR.iterdir()]}"
         )
     return files
 
 
-def load_one_day_aggregated(path: Path, cell_col: str, time_col: str, activity_cols: list[str]) -> pd.DataFrame:
-    """Loads a single day's file and immediately collapses country-code rows
-    into one row per (cell, timestamp) by summing activity columns."""
-    print(f"  Loading {path.name} ...", flush=True)
-    day_df = pd.read_csv(path, sep=None, engine="python")
+def load_and_aggregate_one_file(path: Path) -> pd.DataFrame:
+    """Loads one raw file, converts timestamps to real local Milan time,
+    and aggregates to hourly totals per cell - done per-file (not all
+    files at once) to stay memory-safe, the same pattern used from the
+    start of this project."""
+    is_raw_txt = path.suffix == ".txt"
 
-    # Downcast numeric columns to reduce memory before aggregating
-    for col in activity_cols:
-        if col in day_df.columns:
-            day_df[col] = pd.to_numeric(day_df[col], errors="coerce", downcast="float")
-
-    agg = (
-        day_df.groupby([cell_col, time_col], as_index=False)[activity_cols]
-        .sum()
-    )
-    agg["_source_file"] = path.name
-    print(f"    -> {len(day_df):,} raw rows collapsed to {len(agg):,} (cell, time) rows")
-    return agg
-
-
-def load_and_validate() -> pd.DataFrame:
-    files = find_activity_files()
-    print(f"Found {len(files)} activity file(s).")
-
-    # Peek at the first file only, to confirm real column names before processing all 7
-    print(f"\nPeeking at {files[0].name} to confirm real column names ...")
-    peek = pd.read_csv(files[0], sep=None, engine="python", nrows=5)
-    print("Real columns found:", list(peek.columns))
-
-    cell_col = next((c for c in peek.columns if "cell" in c.lower()), None)
-    time_col = next(
-        (c for c in peek.columns if any(k in c.lower() for k in ("time", "date"))), None
-    )
-    activity_cols = [c for c in ACTIVITY_COLS_GUESS if c in peek.columns]
-
-    if not cell_col or not time_col:
-        raise ValueError(
-            f"Couldn't auto-detect cell/time columns from: {list(peek.columns)}. "
-            "Paste this column list back so we can fix the detection logic."
+    if is_raw_txt:
+        df = pd.read_csv(path, sep="\t", header=None, names=COLUMN_NAMES)
+        df["datetime"] = (
+            pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
+            .dt.tz_convert("Europe/Rome")
+            .dt.tz_localize(None)
         )
-    if not activity_cols:
-        raise ValueError(
-            f"None of the expected activity columns {ACTIVITY_COLS_GUESS} were found in "
-            f"{list(peek.columns)}. Paste the real column list back so we can fix this."
-        )
-
-    print(f"Using cell_col='{cell_col}', time_col='{time_col}', activity_cols={activity_cols}")
-
-    print("\nProcessing each day (loading + aggregating one at a time)...")
-    daily_frames = [
-        load_one_day_aggregated(f, cell_col, time_col, activity_cols) for f in files
-    ]
-
-    print("\nCombining all aggregated days...")
-    df = pd.concat(daily_frames, ignore_index=True)
-
-    print("\n--- VALIDATION (combined, already aggregated across country codes) ---")
-    print("Final shape:", df.shape)
-    print("Columns:", list(df.columns))
-    print("\nMissing values:")
-    print(df.isna().sum())
-    print("\nSample rows:")
-    print(df.head(10).to_string())
-
-    if pd.api.types.is_numeric_dtype(df[time_col]):
-        parsed = pd.to_datetime(df[time_col], unit="ms", errors="coerce")
-        print(f"\n'{time_col}' parsed as epoch milliseconds.")
+        for col in ACTIVITY_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     else:
-        parsed = pd.to_datetime(df[time_col], errors="coerce")
-        print(f"\n'{time_col}' parsed as a normal datetime string.")
-    print("Real date range:", parsed.min(), "to", parsed.max())
-    unique_steps = sorted(parsed.dropna().unique())
-    if len(unique_steps) > 1:
-        step_diff = pd.Series(unique_steps).diff().dropna().mode()
-        print("Most common interval between timestamps:", step_diff.iloc[0] if not step_diff.empty else "unknown")
+        df = pd.read_csv(path)
+        df["datetime"] = pd.to_datetime(df["datetime"])
 
-    print("\nNumber of distinct cells:", df[cell_col].nunique())
+    raw_row_count = len(df)
 
-    return df
+    per_cell_hour = df.groupby(["CellID", "datetime"])[ACTIVITY_COLS].sum(min_count=0).reset_index()
+
+    if is_raw_txt:
+        per_cell_hour["datetime"] = per_cell_hour["datetime"].dt.floor("h")
+        per_cell_hour = per_cell_hour.groupby(["CellID", "datetime"])[ACTIVITY_COLS].sum(min_count=0).reset_index()
+
+    print(f"    -> {raw_row_count:,} raw rows collapsed to {len(per_cell_hour):,} (cell, hour) rows")
+    return per_cell_hour
 
 
 if __name__ == "__main__":
-    df = load_and_validate()
+    files = find_activity_files()
+    print(f"Found {len(files)} activity file(s).")
+
+    if files[0].suffix == ".txt":
+        print("\nDetected raw Harvard Dataverse .txt files (tab-separated, 10-minute granularity, no header).")
+    else:
+        print("\nDetected pre-aggregated Kaggle .csv files (hourly, comma-separated, with header).")
+
+    print("\nProcessing each day (loading + aggregating one at a time)...")
+    all_days = []
+    for f in files:
+        print(f"  Loading {f.name} ...")
+        all_days.append(load_and_aggregate_one_file(f))
+
+    print("\nCombining all aggregated days...")
+    combined = pd.concat(all_days, ignore_index=True)
+
+    # REAL GAP FOUND AND FIXED: some (cell, hour) combinations have ZERO
+    # rows in the raw data at all (not a zero-value row — no row exists),
+    # when a cell had no activity across every country code that hour.
+    # Confirmed by day-by-day row counts drifting below the expected
+    # 240,000 (10,000 cells x 24 hours) as the dataset progresses.
+    # Left unfixed, this would silently corrupt lag-based features
+    # downstream (a shift(1) would grab the wrong hour's value across a
+    # gap, with no error raised). Reindex to guarantee every cell has
+    # exactly one row per hour across the full range, filling any truly
+    # missing hour with 0 — consistent with how empty raw fields are
+    # already treated.
+    full_hours = pd.date_range(combined["datetime"].min(), combined["datetime"].max(), freq="h")
+    all_cells = combined["CellID"].unique()
+    full_index = pd.MultiIndex.from_product([all_cells, full_hours], names=["CellID", "datetime"])
+    before_reindex = len(combined)
+    combined = (
+        combined.set_index(["CellID", "datetime"])
+        .reindex(full_index, fill_value=0)
+        .reset_index()
+    )
+    gap_rows_filled = len(combined) - before_reindex
+    print(f"Reindexed to guarantee complete (cell, hour) coverage: "
+          f"filled {gap_rows_filled:,} genuinely missing hours with 0 "
+          f"({gap_rows_filled/len(combined):.3%} of the full grid).")
+
+    print("\n--- VALIDATION (combined, already aggregated across country codes and to hourly) ---")
+    print("Final shape:", combined.shape)
+    print("Columns:", list(combined.columns))
+    print("\nMissing values:")
+    print(combined.isna().sum())
+    print("\nSample rows:")
+    print(combined.head(10).to_string())
+
+    print("\nReal date range:", combined["datetime"].min(), "to", combined["datetime"].max())
+    intervals = combined.sort_values(["CellID", "datetime"]).groupby("CellID")["datetime"].diff().dropna()
+    print("Most common interval between timestamps:", intervals.mode()[0] if len(intervals) else "n/a")
+    print("\nNumber of distinct cells:", combined["CellID"].nunique())
+
     out_path = RAW_DIR / "cdr_activity_aggregated.parquet"
     try:
-        df.to_parquet(out_path, index=False)
+        combined.to_parquet(out_path, index=False)
         print(f"\nSaved aggregated activity data to {out_path}")
     except ImportError:
         csv_out = RAW_DIR / "cdr_activity_aggregated.csv"
-        df.to_csv(csv_out, index=False)
-        print(f"\n'pyarrow' not installed — saved as CSV instead: {csv_out}")
+        combined.to_csv(csv_out, index=False)
+        print(f"\n'pyarrow' not installed - saved as CSV instead: {csv_out}")
+
     print("\nDone. Paste the printed output back so we can confirm the real structure together.")

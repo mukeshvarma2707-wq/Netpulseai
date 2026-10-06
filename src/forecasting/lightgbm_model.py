@@ -36,7 +36,7 @@ from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 
-TRAIN_DAYS = 5
+TRAIN_DAYS = 45
 LAGS = [1, 2, 3, 24]
 HORIZONS = [1, 2, 3, 4]
 GRID_SIZE = 100

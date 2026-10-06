@@ -2,43 +2,20 @@
 src/optimization/solver.py
 
 Computes capacity reallocation for ROUTINE congested cells using a
-constrained linear program (Google OR-Tools) — never the LLM. This is
-BalanceGrid's central design principle: the solver guarantees every
-recommendation is actually feasible; an LLM asked to invent numbers has no
-such guarantee.
+constrained linear program (Google OR-Tools) -- never the LLM.
 
-DESIGN DECISION (flagging explicitly): solving each congested cell's
-reallocation INDEPENDENTLY would risk double-allocating the same neighbor's
-spare capacity to two different congested cells that happen to share that
-neighbor. The correct fix, used here: solve ONE JOINT LP PER HOUR, covering
-every congested cell and its real neighbors together, so a shared neighbor's
-spare capacity can never be promised to more than one cell at once.
-
-WHAT "CAPACITY" MEANS HERE (since the dataset has no true capacity ceiling —
-recall the k-constant issue: activity values are scaled by an undisclosed
-constant, so there's no real-world capacity number to work against):
-  - deficit of a congested cell c  = forecast_c - threshold_c  (how far over
-    its own normal ceiling it's predicted to go)
-  - spare capacity of a neighbor n = max(0, threshold_n - forecast_n)  (how
-    much n could absorb before IT would also cross its own threshold)
-This is a self-consistent, defensible definition using only data we
-actually have, not an invented number.
-
-THE LP, PER HOUR:
-    Variables:      x[c, n] >= 0  for every congested cell c and each of its
-                     real neighbors n
-    Constraint 1:    sum_n x[c, n] <= deficit_c            (per congested cell)
-    Constraint 2:    sum_c x[c, n] <= spare_n              (per neighbor,
-                     aggregated across every congested cell that might draw
-                     from it — this is what prevents double-allocation)
-    Objective:       maximize total deficit covered across the whole city
-                     for that hour
+UPDATED: now loads the FORECAST from generate_forecasts.py's saved
+LightGBM predictions, instead of computing an internal seasonal-naive
+forecast -- same reasoning as diagnosis_agent.py's update. The solver's
+actual optimization logic (joint per-hour LP, no double-allocation of a
+shared neighbor's spare capacity) is UNCHANGED.
 
 REQUIREMENTS:
     pip install pandas numpy ortools pyarrow
 
 INPUT:
     data/raw/cdr_with_congestion_flags.parquet (or .csv)
+    data/raw/cell_forecasts.parquet (or .csv) -- from generate_forecasts.py
 
 RUN:
     python src/optimization/solver.py
@@ -53,12 +30,15 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 ACTIVITY_COLS = ["smsin", "smsout", "callin", "callout", "internet"]
 GRID_SIZE = 100
 NEIGHBOR_FRACTION_THRESHOLD = 0.3
-KNOWN_HOLIDAYS = {pd.Timestamp("2013-11-01").date()}
-HORIZON = 1  # start with +1h; the same logic extends to other horizons
+KNOWN_HOLIDAYS = {
+    pd.Timestamp("2013-11-01").date(),
+    pd.Timestamp("2013-12-08").date(),
+    pd.Timestamp("2013-12-25").date(),
+    pd.Timestamp("2013-12-26").date(),
+    pd.Timestamp("2014-01-01").date(),
+}
+HORIZON = 1
 
-
-# ---- Shared helpers (kept in sync with diagnosis_agent.py; duplicated
-# deliberately here for robustness rather than a cross-folder import) ----
 
 def cell_id_to_xy(cell_id: int) -> tuple:
     y, x = divmod(cell_id - 1, GRID_SIZE)
@@ -99,11 +79,26 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-def compute_forecast_and_risk(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    df = df.sort_values(["CellID", "datetime"]).reset_index(drop=True)
-    grouped = df.groupby("CellID")["total_activity"]
-    df["forecast"] = grouped.shift(24 - horizon)
-    df["target_datetime"] = df["datetime"] + pd.to_timedelta(horizon, unit="h")
+def load_forecasts() -> pd.DataFrame:
+    parquet_path = DATA_DIR / "cell_forecasts.parquet"
+    csv_path = DATA_DIR / "cell_forecasts.csv"
+    if parquet_path.exists():
+        forecasts = pd.read_parquet(parquet_path)
+    elif csv_path.exists():
+        forecasts = pd.read_csv(csv_path)
+    else:
+        raise FileNotFoundError(f"Couldn't find cell_forecasts file in {DATA_DIR}. Run generate_forecasts.py first.")
+    dt_cols = ["datetime"] + [c for c in forecasts.columns if c.startswith("target_datetime_")]
+    for col in dt_cols:
+        if not pd.api.types.is_datetime64_any_dtype(forecasts[col]):
+            forecasts[col] = pd.to_datetime(forecasts[col])
+    return forecasts
+
+
+def attach_forecast_and_risk(df: pd.DataFrame, forecasts: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    cols_needed = ["CellID", "datetime", f"forecast_{horizon}h", f"target_datetime_{horizon}h"]
+    df = df.merge(forecasts[cols_needed], on=["CellID", "datetime"], how="left")
+    df = df.rename(columns={f"forecast_{horizon}h": "forecast", f"target_datetime_{horizon}h": "target_datetime"})
     df["deficit"] = (df["forecast"] - df["congestion_threshold"]).clip(lower=0)
     df["spare"] = (df["congestion_threshold"] - df["forecast"]).clip(lower=0)
     df = df.dropna(subset=["forecast"])
@@ -111,8 +106,6 @@ def compute_forecast_and_risk(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
 
 def classify_routine(df: pd.DataFrame) -> pd.DataFrame:
-    """Reruns the diagnosis classification (kept in sync with diagnosis_agent.py)
-    so the solver only acts on ROUTINE cases, exactly as designed."""
     is_risk = df["deficit"] > 0
     flagged = df[is_risk].copy()
     at_risk_by_hour = flagged.groupby(
@@ -131,7 +124,7 @@ def classify_routine(df: pd.DataFrame) -> pd.DataFrame:
         if frac >= NEIGHBOR_FRACTION_THRESHOLD:
             return True
         if source_date in KNOWN_HOLIDAYS:
-            return False  # holiday-based forecast basis -> treated as anomalous, not auto-handled
+            return False
         return False
 
     flagged["is_routine"] = flagged.apply(classify, axis=1)
@@ -139,9 +132,6 @@ def classify_routine(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def solve_hour(congested_cells: pd.DataFrame, all_cells_this_hour: pd.DataFrame):
-    """One joint LP for a single hour: which congested cells draw how much
-    from which real neighbors, without double-allocating any neighbor's
-    spare capacity."""
     from ortools.linear_solver import pywraplp
 
     solver = pywraplp.Solver.CreateSolver("GLOP")
@@ -150,8 +140,8 @@ def solve_hour(congested_cells: pd.DataFrame, all_cells_this_hour: pd.DataFrame)
 
     spare_lookup = all_cells_this_hour.set_index("CellID")["spare"].to_dict()
 
-    x_vars = {}  # (congested_cell, neighbor) -> LP variable
-    neighbor_usage = {}  # neighbor -> list of variables drawing from it
+    x_vars = {}
+    neighbor_usage = {}
 
     for _, row in congested_cells.iterrows():
         c = row["CellID"]
@@ -166,8 +156,6 @@ def solve_hour(congested_cells: pd.DataFrame, all_cells_this_hour: pd.DataFrame)
         if cell_vars:
             solver.Add(sum(cell_vars) <= deficit)
 
-    # Constraint 2: a neighbor's spare capacity can't be over-allocated across
-    # multiple congested cells drawing from it simultaneously
     for n, var_list in neighbor_usage.items():
         solver.Add(sum(var_list) <= spare_lookup[n])
 
@@ -185,9 +173,11 @@ def solve_hour(congested_cells: pd.DataFrame, all_cells_this_hour: pd.DataFrame)
 
 if __name__ == "__main__":
     df = load_data()
+    forecasts = load_forecasts()
     print(f"Loaded {len(df):,} rows across {df['CellID'].nunique()} cells.")
+    print(f"Loaded {len(forecasts):,} pre-computed LightGBM forecast rows.")
 
-    df = compute_forecast_and_risk(df, HORIZON)
+    df = attach_forecast_and_risk(df, forecasts, HORIZON)
     routine_flagged = classify_routine(df)
     routine_cells = routine_flagged[routine_flagged["is_routine"]]
     print(f"\n{len(routine_cells):,} ROUTINE congested (cell, hour) combinations to solve for.")
@@ -219,8 +209,9 @@ if __name__ == "__main__":
     print(f"Total deficit covered by reallocation:         {total_deficit_covered:,.1f}")
     if total_deficit_needed > 0:
         print(f"Overall coverage rate: {total_deficit_covered/total_deficit_needed:.1%}")
-    print(f"Fully resolved cases: {n_fully_resolved:,} / {len(routine_cells):,} "
-          f"({n_fully_resolved/len(routine_cells):.1%})" if len(routine_cells) else "")
+    if len(routine_cells):
+        print(f"Fully resolved cases: {n_fully_resolved:,} / {len(routine_cells):,} "
+              f"({n_fully_resolved/len(routine_cells):.1%})")
 
     print("\n--- Sample solved hour, showing actual reallocation recommendations ---")
     for hour in unique_hours[:1]:
@@ -231,8 +222,6 @@ if __name__ == "__main__":
         if not sol:
             print("  (no reallocation needed or possible this hour)")
 
-    # Persist ALL reallocation results (not just the printed sample) so the
-    # report-generation agent can consume them.
     records = []
     for hour, sol in all_solutions.items():
         for (c, n), amount in sol.items():
@@ -243,12 +232,8 @@ if __name__ == "__main__":
         solutions_df.to_parquet(out_path, index=False)
         print(f"\nSaved {len(solutions_df):,} reallocation records to {out_path}")
     except ImportError:
-        csv_out = DATA_DIR / "reallocation_results.csv"
-        solutions_df.to_csv(csv_out, index=False)
-        print(f"\n'pyarrow' not installed — saved as CSV instead: {csv_out}")
+        solutions_df.to_csv(DATA_DIR / "reallocation_results.csv", index=False)
 
-    # Also persist per-case coverage summary (deficit vs. covered), needed by
-    # the report agent to state HOW MUCH of each case was actually resolved.
     coverage_records = []
     for _, row in routine_cells.iterrows():
         c, hour = row["CellID"], row["target_datetime"]
@@ -264,6 +249,5 @@ if __name__ == "__main__":
         print(f"Saved {len(coverage_df):,} coverage records to {cov_out}")
     except ImportError:
         coverage_df.to_csv(DATA_DIR / "reallocation_coverage.csv", index=False)
-        print(f"'pyarrow' not installed — saved coverage as CSV instead.")
 
     print("\nDone. Paste the printed output back so we can validate the solver's behavior together.")

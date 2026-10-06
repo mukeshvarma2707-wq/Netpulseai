@@ -1,38 +1,24 @@
 """
 src/diagnosis/diagnosis_agent.py
 
-Deterministic diagnosis logic: for each (cell, hour) where the seasonal-naive
-forecast predicts congestion risk, classifies it as ROUTINE (safe to hand to
-the solver for automatic reallocation) or ANOMALOUS (escalate to a human).
+Deterministic diagnosis logic: for each (cell, hour) where the forecast
+predicts congestion risk, classifies it as ROUTINE (safe to hand to the
+solver) or ANOMALOUS (escalate to a human).
 
-WHY DETERMINISTIC FIRST, NOT AN LLM AGENT YET: the core classification logic
-(grid adjacency, neighbor-correlation threshold, calendar check) needs to be
-correct and empirically validated on its own before wrapping it in an
-agent/LLM layer. Adding natural-language explanation generation on top of
-validated logic is a separate, lower-risk step — this script is that
-foundation.
-
-TWO SIGNALS, BOTH GROUNDED IN DOCUMENTED FACTS (not guesses):
-1. NEIGHBORING-CELL CORRELATION: uses the grid's actual documented indexing
-   formula from the official dataset paper (Barlacchi et al. 2015):
-   CellID = y*100 + x. We invert this to get (x, y) grid coordinates for
-   any CellID, then find its real 8-connected spatial neighbors.
-2. CALENDAR CHECK: November 1, 2013 (Ognissanti) is the one real, documented
-   public holiday in our 7-day window.
-
-CLASSIFICATION RULE:
-    - If the forecasted congestion hour falls on a known holiday, OR a high
-      fraction of the cell's real spatial neighbors are ALSO forecasted at
-      risk that same hour (suggesting an area-wide, explainable pattern
-      rather than an isolated glitch) -> ROUTINE.
-    - Otherwise (an isolated single-cell spike with no calendar explanation)
-      -> ANOMALOUS, escalate to a human.
+UPDATED: now loads the FORECAST from generate_forecasts.py's saved
+LightGBM predictions (data/raw/cell_forecasts.parquet), instead of
+computing an internal seasonal-naive forecast. This reflects the real,
+validated finding that LightGBM beats seasonal-naive given the full
+~62-day dataset. Everything else -- the congestion threshold comparison,
+neighbor-correlation logic, and holiday checks -- is UNCHANGED; only
+where the forecast number comes from changed.
 
 REQUIREMENTS:
     pip install pandas numpy pyarrow
 
 INPUT:
     data/raw/cdr_with_congestion_flags.parquet (or .csv)
+    data/raw/cell_forecasts.parquet (or .csv) -- from generate_forecasts.py
 
 RUN:
     python src/diagnosis/diagnosis_agent.py
@@ -46,15 +32,16 @@ import pandas as pd
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
 ACTIVITY_COLS = ["smsin", "smsout", "callin", "callout", "internet"]
 
-GRID_SIZE = 100  # 100 x 100 grid, per the dataset paper
-NEIGHBOR_FRACTION_THRESHOLD = 0.3  # tuned down from 0.4 after testing: corner cells of a
-# spike area only have 3/8 real neighbors inside the affected block (37.5%), which a 0.4
-# threshold wrongly excluded from "routine" — 0.3 correctly includes them while still
-# correctly flagging a genuinely isolated single-cell spike (0/8 neighbors) as anomalous.
+GRID_SIZE = 100
+NEIGHBOR_FRACTION_THRESHOLD = 0.3
 
-# The one real, documented holiday in our 7-day window (Barlacchi et al. 2015
-# / general knowledge: Nov 1 = Ognissanti, an Italian public holiday)
-KNOWN_HOLIDAYS = {pd.Timestamp("2013-11-01").date()}
+KNOWN_HOLIDAYS = {
+    pd.Timestamp("2013-11-01").date(),
+    pd.Timestamp("2013-12-08").date(),
+    pd.Timestamp("2013-12-25").date(),
+    pd.Timestamp("2013-12-26").date(),
+    pd.Timestamp("2014-01-01").date(),
+}
 
 
 def load_data() -> pd.DataFrame:
@@ -65,10 +52,7 @@ def load_data() -> pd.DataFrame:
     elif csv_path.exists():
         df = pd.read_csv(csv_path)
     else:
-        raise FileNotFoundError(
-            f"Couldn't find cdr_with_congestion_flags.parquet or .csv in {DATA_DIR}. "
-            "Run src/features/congestion_threshold.py first."
-        )
+        raise FileNotFoundError(f"Couldn't find cdr_with_congestion_flags file in {DATA_DIR}.")
     if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
         df["datetime"] = pd.to_datetime(df["datetime"])
     present_cols = [c for c in ACTIVITY_COLS if c in df.columns]
@@ -77,9 +61,24 @@ def load_data() -> pd.DataFrame:
     return df
 
 
+def load_forecasts() -> pd.DataFrame:
+    parquet_path = DATA_DIR / "cell_forecasts.parquet"
+    csv_path = DATA_DIR / "cell_forecasts.csv"
+    if parquet_path.exists():
+        forecasts = pd.read_parquet(parquet_path)
+    elif csv_path.exists():
+        forecasts = pd.read_csv(csv_path)
+    else:
+        raise FileNotFoundError(f"Couldn't find cell_forecasts file in {DATA_DIR}. Run generate_forecasts.py first.")
+    dt_cols = ["datetime"] + [c for c in forecasts.columns if c.startswith("target_datetime_")]
+    for col in dt_cols:
+        if not pd.api.types.is_datetime64_any_dtype(forecasts[col]):
+            forecasts[col] = pd.to_datetime(forecasts[col])
+    return forecasts
+
+
 def cell_id_to_xy(cell_id: int) -> tuple:
-    """Inverts the documented grid formula (CellID = y*100 + x) to get (x, y)."""
-    y, x = divmod(cell_id - 1, GRID_SIZE)  # -1 for 1-indexed CellID
+    y, x = divmod(cell_id - 1, GRID_SIZE)
     return x + 1, y + 1
 
 
@@ -88,7 +87,6 @@ def xy_to_cell_id(x: int, y: int) -> int:
 
 
 def get_neighbors(cell_id: int) -> list:
-    """Real 8-connected spatial neighbors, respecting grid boundaries."""
     x, y = cell_id_to_xy(cell_id)
     neighbors = []
     for dx in (-1, 0, 1):
@@ -101,15 +99,10 @@ def get_neighbors(cell_id: int) -> list:
     return neighbors
 
 
-def compute_naive_forecast_and_risk(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    """Seasonal-naive forecast for a given horizon (same hour, 24h before the
-    target), and whether that forecast crosses the cell's own congestion
-    threshold — i.e. PREDICTED risk, not historical/retrospective risk."""
-    df = df.sort_values(["CellID", "datetime"]).reset_index(drop=True)
-    grouped = df.groupby("CellID")["total_activity"]
-    df[f"naive_forecast_{horizon}h"] = grouped.shift(24 - horizon)
-    df[f"predicted_risk_{horizon}h"] = df[f"naive_forecast_{horizon}h"] > df["congestion_threshold"]
-    df[f"target_datetime_{horizon}h"] = df["datetime"] + pd.to_timedelta(horizon, unit="h")
+def attach_forecast_and_risk(df: pd.DataFrame, forecasts: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    cols_needed = ["CellID", "datetime", f"forecast_{horizon}h", f"target_datetime_{horizon}h"]
+    df = df.merge(forecasts[cols_needed], on=["CellID", "datetime"], how="left")
+    df[f"predicted_risk_{horizon}h"] = df[f"forecast_{horizon}h"] > df["congestion_threshold"]
     return df
 
 
@@ -124,7 +117,6 @@ def diagnose(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     if flagged.empty:
         return flagged
 
-    # Build a fast lookup: for each (target hour), which cells are flagged at risk
     flagged["target_hour_key"] = flagged[target_dt_col].values.astype("datetime64[h]")
     at_risk_by_hour = flagged.groupby("target_hour_key")["CellID"].apply(set).to_dict()
 
@@ -144,15 +136,10 @@ def diagnose(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
         if neighbor_fraction >= NEIGHBOR_FRACTION_THRESHOLD:
             return "ROUTINE", f"{n_neighbors_at_risk}/{len(neighbors)} neighbors also at risk"
 
-        # SECOND CALENDAR CHECK, distinct from the first: the naive forecast's
-        # basis value (the "yesterday" it copied from) may itself have come
-        # from an atypical day, like a holiday. That doesn't mean today is
-        # genuinely busy — it means the forecast basis is unreliable, which
-        # is a reason for EXTRA caution, not confident auto-handling.
         if source_date in KNOWN_HOLIDAYS:
-            return "ANOMALOUS", "isolated, AND forecast is based on a holiday — basis may be unreliable"
+            return "ANOMALOUS", "isolated, AND forecast is based on a holiday -- basis may be unreliable"
 
-        return "ANOMALOUS", f"isolated — only {n_neighbors_at_risk}/{len(neighbors)} neighbors at risk"
+        return "ANOMALOUS", f"isolated -- only {n_neighbors_at_risk}/{len(neighbors)} neighbors at risk"
 
     results = flagged.apply(classify, axis=1, result_type="expand")
     flagged["classification"] = results[0]
@@ -168,18 +155,20 @@ def diagnose(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
 if __name__ == "__main__":
     df = load_data()
+    forecasts = load_forecasts()
     print(f"Loaded {len(df):,} rows across {df['CellID'].nunique()} cells.")
+    print(f"Loaded {len(forecasts):,} pre-computed LightGBM forecast rows.")
 
     all_diagnoses = {}
     for h in [1, 2, 3, 4]:
-        df = compute_naive_forecast_and_risk(df, h)
+        df = attach_forecast_and_risk(df, forecasts, h)
         diagnosed = diagnose(df, h)
         all_diagnoses[h] = diagnosed
 
     print("\n--- Sample of ANOMALOUS cases (worth a manual sanity check) ---")
     sample = all_diagnoses[1][all_diagnoses[1]["classification"] == "ANOMALOUS"]
     if not sample.empty:
-        print(sample[["CellID", "target_datetime_1h", "naive_forecast_1h", "congestion_threshold", "reason"]].head(10).to_string())
+        print(sample[["CellID", "target_datetime_1h", "forecast_1h", "congestion_threshold", "reason"]].head(10).to_string())
     else:
         print("(none found at +1h)")
 
@@ -190,6 +179,6 @@ if __name__ == "__main__":
     except ImportError:
         csv_out = DATA_DIR / "diagnosis_results_1h.csv"
         all_diagnoses[1].to_csv(csv_out, index=False)
-        print(f"\n'pyarrow' not installed — saved as CSV instead: {csv_out}")
+        print(f"\n'pyarrow' not installed -- saved as CSV instead: {csv_out}")
 
     print("\nDone. Paste the printed output back so we can sanity-check the classification logic together.")
