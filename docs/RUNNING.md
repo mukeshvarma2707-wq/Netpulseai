@@ -104,6 +104,71 @@ evaluation predictions in `data\experiments\phase2\preds\`
 The whole build (steps 1-6) takes about 2 minutes. Step 6 clears and
 reloads the v2 tables, including any reports generated in v2 mode.
 
+## Scoring one origin hour from raw activity (v2)
+
+`src\forecasting\score_v2.py` scores ONE chosen origin hour directly from
+raw activity with the saved v2 models, then runs the v2 rules (watch flags,
+diagnosis, V0 solver at +1h). It does not read the saved prediction files.
+
+**This replays hours inside the 62-day dataset (Nov 1 2013 - Jan 1 2014).
+It is not live forecasting.**
+
+**Information set:** features at origin t use activity up to t-1 only;
+hour t is never used. So the lead time from the last observed hour is h+1
+hours: 2, 3, 4 and 5 hours for +1h to +4h.
+
+**Models folder:** `data\processed\v2\models\` holds copies of the five
+model files and `models_manifest.json`:
+- the SHA-256 of each file;
+- the LightGBM version (4.7.0);
+- the feature order, trees and leaves;
+- `CellID` as categorical;
+- the source and hash of `cell_historical_mean`;
+- the hotspot set and rule;
+- the target transform and float32 features;
+- the training period;
+- the `forecast_kind` rules and the information-set convention.
+
+The folder is ignored by git, like the rest of `data\processed\`. Create it
+once (it copies from `data\experiments\phase2\models\` and checks hashes):
+
+```powershell
+.\venv\Scripts\python.exe src\forecasting\score_v2.py install-models
+```
+
+**Score an origin:**
+
+```powershell
+.\venv\Scripts\python.exe src\forecasting\score_v2.py score --origin "2013-12-18 11:00"
+# options: --horizons 1 2 3 4   --no-solver   --force (overwrite an existing output folder)
+```
+
+**Inputs and outputs:**
+- **Inputs (read-only):** `data\raw\cdr_with_congestion_flags.parquet`
+  (only `CellID`, `datetime` and `total_activity`; its threshold and flag
+  columns are never read), the models, and `thresholds_v2.parquet`.
+- **Outputs:** `data\processed\v2\scored\<YYYYMMDD_HHMM>\`, containing
+  `forecasts`, `watch_flags`, `diagnosis`, `solver_moves` and `coverage`
+  (parquet), plus `manifest.json`. The script refuses to overwrite unless
+  `--force` is given.
+
+**Valid origins:** 2013-11-02 00:00 to 2014-01-02 00:00. Earlier origins
+are rejected (fewer than 24 hours of history).
+
+**Labels:** every output row carries `forecast_kind`, applied to the
+forecasts, flags, diagnosis and solver outputs alike:
+
+| Label | When |
+|---|---|
+| `in-sample` | target before Dec 10; look-ahead thresholds and cell means |
+| `validation` | target Dec 10-16 |
+| `unevaluated` | target Dec 17 00:00-03:00 from a Dec 16 origin |
+| `test` | target Dec 17 - Jan 1 23:00 |
+| `forecast` | target after Jan 1 23:00; no actuals |
+
+**Time and memory:** about 30 s per run (load panel 10-20 s, load models
+5 s, score 5-7 s); peak commit about 2.7 GB.
+
 ## Memory
 
 - **Check headroom first.** Check the commit headroom before a heavy step:

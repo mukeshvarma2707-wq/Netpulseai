@@ -1642,6 +1642,12 @@ country-code share was measured on one Trentino file.
 - **It also affects the neighbour rule and the neighbour features:** part of
   the co-flagging that makes a flag ROUTINE comes from shared coverage
   areas, not from independent congestion in neighbouring squares.
+- **Measured (see "Shared-coverage check"):** exact twins make up 4.4% of
+  neighbour pairs and sit in quiet outer areas. None are within 10 squares
+  of Duomo; 0.2% of the highest-activity decile and 28% of the
+  lowest-activity decile belong to a twin group. Partial sharing cannot be
+  separated from similar neighbourhoods without the coverage-area geometry,
+  which is not in the dataset.
 
 **(b) "Internet" counts records, not data volume. Totals mix record types.**
 - **What a record is:** an internet record is written when a connection
@@ -1677,6 +1683,256 @@ country-code share was measured on one Trentino file.
   Trentino check cells are **exactly these examples**. They confirm that our
   loading reproduces the paper's patterns. They are not independent evidence
   that the data measure network load.
+
+---
+
+## Shared-coverage check (do neighbouring squares share base-station load?)
+
+Script: `src/evaluation/shared_coverage_check.py` (steps `stage1`,
+`stage1map`, `stage2`). Outputs are in `data\experiments\shared_coverage\`.
+Milan only. `data\raw\cdr_activity_aggregated.parquet` was read only.
+
+**Why it matters.** Under the paper's construction (dataset limitation a),
+equal-size squares that lie fully inside the same coverage area must have
+identical series in every channel. Such "twin" squares share one
+measurement, so a transfer between them is not a capacity move. A twin
+neighbour also confirms a flag only trivially.
+
+### Stage 1: how common is sharing?
+
+**Decisions and constants** (declared before results):
+- **Pairs:** 39,402 unordered 8-neighbour pairs (78,804 directed neighbour
+  relations).
+- **Twin:** all five channels within relative tolerance at all 1,488 hours;
+  two zeros match. Primary tolerance 1e-9, sensitivity 1e-6 and 1e-4.
+- **Near-twin:** matches at ≥ 99% of hours. The loader fills missing hours
+  with 0, which can break an exact twin at a few hours.
+- **Proportional:** not a twin; the ratio of hourly totals has a
+  coefficient of variation below 1e-6, and there is no hour where exactly
+  one of the two is 0.
+- **Exclusion:** cells with zero variance, or mean total activity below
+  1.0 per hour. No cell was excluded.
+- **Twin groups:** connected components of the twin pairs.
+
+| Measure | Result |
+|---|---|
+| Twin pairs, tolerance 1e-9 / 1e-6 / 1e-4 | **1,722** / 1,722 / 1,723 |
+| Near-twin pairs (not exact) | 9, all in one block of seven cells (5530, 5629-5631, 5729-5731), differing at 3 of 1,488 hours |
+| Proportional pairs (not twin) | 3 (273-274, 273-374, 5413-5514) |
+| **Share of pairs that are twin or proportional** | **4.4%** |
+| Twin groups / size distribution | 246 groups: 88 of size 2, 47 of 3, 34 of 4, …, largest 28 |
+| Cells in a twin group | 1,141 (11.4% of cells) |
+| **Share of total activity carried by those cells** | **3.8%** |
+| Duomo, Bocconi, Navigli | 0 twin and 0 proportional neighbours; neighbour correlation 0.82-0.99 |
+
+**Where the twins are.** They are in quiet outer areas, which is consistent
+with large coverage areas there:
+
+| Distance from Duomo (squares) | 0-10 | 10-20 | 20-30 | 30-45 | 45+ |
+|---|---|---|---|---|---|
+| Share of cells in a twin group | 0% | 1.4% | 10.5% | 10.1% | 16.4% |
+
+| Activity decile (1 = quietest) | 1 | 2 | 3 | 5 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|
+| Share in a twin group | 28% | 18% | 18% | 13% | 4.7% | 1.9% | 0.2% |
+
+**Ordinary pairs** (not twin, not proportional): correlation of the hourly
+total-activity series.
+
+| Percentile | 1% | 10% | 25% | 50% | 75% | 90% | 95% |
+|---|---|---|---|---|---|---|---|
+| Correlation | 0.49 | 0.79 | 0.89 | 0.961 | 0.993 | 0.9997 | 0.99997 |
+
+- **7.3% of ordinary pairs correlate at ≥ 0.9999**, and 14% at ≥ 0.999.
+  Such pairs are more common among quiet cells (10.5% of pairs in the
+  lowest activity decile vs 0.2% in the highest).
+- **1,225 non-twin pairs match exactly at some hours** but not at all of
+  them (including the 9 near-twins).
+- Both observations are consistent with **partial** shared coverage, but
+  also with genuinely similar neighbourhoods.
+
+**Pre-declared rule and decision.**
+- **The rule:** sharing is "material" if more than 10% of neighbour pairs,
+  or more than 10% of activity, involve twin or proportional pairs. **The
+  10% threshold is arbitrary.**
+- **Decision: not material under the strict definition** (4.4% of pairs,
+  3.8% of activity).
+- **This is a lower bound.** The strict test detects only full containment
+  in one coverage area. The share of *cells* in twin groups (11.4%) is
+  above 10%, but the rule is on pairs and activity.
+
+Time: 32 s; peak commit 3.0 GB.
+
+### Stage 2: solver and diagnosis rule without shared-coverage pairs
+
+**Decisions** (declared before results):
+- **Setup:** as Phases 3-4. The final pooled model at +1h with saved
+  predictions, Phase 3 thresholds, the same 24 non-holiday and 6 holiday
+  hours, and the unchanged diagnosis rule for the solver runs.
+- **Solver:** the unchanged `solve_hour` without restrictions. The
+  validated LP copy (`solve_hour_k`) is used with an allowed-neighbour set.
+- **Outcome replay:** under the one-for-one activity-unit assumption.
+- **Restrictions** (pairs forbidden in both directions):
+
+| Restriction | Definition | Forbidden 1-hop pairs (share of 39,402) | Forbidden pairs within 2 hops (share) |
+|---|---|---|---|
+| S-noNT | exact twins + proportional | 1,725 (4.4%) | 1,725 (1.5%) |
+| **S (strict)** | S-noNT + the 9 near-twins (treated as twins) | **1,734 (4.4%)** | 2,915 (2.5%), including 2,912 same-twin-group pairs |
+| L9999 (loose proxy) | S + ordinary pairs with correlation ≥ 0.9999 | 4,458 (11.3%) | 8,319 (7.1%) |
+| L999 (looser proxy) | S + ordinary pairs with correlation ≥ 0.999 | 7,022 (17.8%) | 13,328 (11.4%) |
+
+- **Same-group pairs at 2 hops:** for the 2-hop ceiling, every pair inside
+  the same twin group (within distance 2) is also forbidden under S and the
+  L brackets. The L brackets also forbid distance-2 pairs whose correlation
+  passes the proxy.
+- **The loose proxy also removes genuinely similar neighbours.** It is an
+  over-restrictive upper bracket, not an estimate of true sharing.
+
+**Solver** (24 non-holiday hours; actual excess before any move 1,261,738;
+net reduction under the one-for-one assumption):
+
+| Variant | Restriction | Net reduction (share) | Gross relief | Donor harm | Original moves between forbidden pairs: amount / count |
+|---|---|---|---|---|---|
+| V0 | none | 184,721 (14.6%) | 247,474 | 62,753 | – |
+| V0 | S | 184,165 (14.6%) | 247,448 | 63,283 | 26 of 354,585 (0.007%) / 10 of 11,254 moves |
+| V0 | L9999 | 184,811 (14.6%) | 247,378 | 62,567 | 168 (0.05%) / 82 |
+| V0 | L999 | 184,381 (14.6%) | 247,344 | 62,963 | 410 (0.12%) / 191 (1.7%) |
+| B m = 0.96 | none | 254,932 (20.2%) | 311,903 | 56,971 | – |
+| B m = 0.96 | S | 254,726 (20.2%) | 311,900 | 57,174 | 3 of 570,111 (0.0005%) / 21 of 16,724 |
+| B m = 0.96 | L9999 | 253,754 (20.1%) | 311,768 | 58,014 | 186 (0.03%) / 91 |
+| B m = 0.96 | L999 | 254,639 (20.2%) | 311,704 | 57,065 | 555 (0.10%) / 224 (1.3%) |
+| Perfect foresight, 1-hop | none / S / L9999 / L999 | 596,143 / 596,143 / 596,143 / 596,130 (**47.2%** in every case) | same | 0 | 0 / 0 / 3 / 40 moves |
+| Perfect foresight, 2-hop | none / S / L9999 / L999 | 909,852 / 909,852 / 909,852 / 909,851 (**72.1%** in every case) | same | 0 | 0 / 0 / 2 / 11 moves |
+
+- **Unrestricted runs reproduce the report exactly:** 184,721 (V0),
+  254,932 (B), 596,143 (1-hop ceiling) and 909,852 (2-hop ceiling).
+- **Differences in net reduction** (restricted − unrestricted, hour-level
+  bootstrap):
+  - V0: −556 (S), +90 (L9999), −340 (L999), all n.s.
+  - B: −206 [−484, −3] (S, nominally significant but 0.08% of B's net),
+    −1,178 (L9999, n.s.), −293 (L999, n.s.).
+  - Ceilings: 0 to −13.
+- **Holiday hours** (6, indicative): changes of at most 113 units (0.02
+  percentage points); V0 5.5%, B 7.2%, 1-hop ceiling 31.5% and 2-hop ceiling
+  55.7% are unchanged to one decimal.
+- A restriction can *raise* net reduction slightly (V0 L9999), because the
+  LP maximises moved deficit, not the net outcome.
+
+**Perfect-foresight ceilings in activity units** (net reduction of actual
+excess; `stage2_solver_summary.csv`):
+
+| Ceiling | Hours (excess before) | none | S-noNT | S | L9999 | L999 |
+|---|---|---|---|---|---|---|
+| 1-hop | 24 non-holiday (1,261,738) | 596,143.27 | 596,143.27 | 596,143.27 | 596,143.12 | 596,130.07 |
+| 2-hop | 24 non-holiday (1,261,738) | 909,851.63 | 909,851.63 | 909,851.63 | 909,851.63 | 909,850.90 |
+| 1-hop | 6 holiday (526,351) | 165,724.57 | 165,724.57 | 165,724.57 | 165,723.08 | 165,719.12 |
+| 2-hop | 6 holiday (526,351) | 293,011.74 | 293,011.74 | 293,011.74 | 293,011.74 | 293,011.56 |
+
+**Under the strict restrictions (S-noNT and S), both ceilings are identical
+to the unrestricted run** (no move used a forbidden pair).
+- **The loose brackets differ slightly:**
+  - L9999: −0.15 units (1-hop) and 0 (2-hop) non-holiday; −1.50 (1-hop)
+    holiday.
+  - L999: −13.20 (1-hop) and −0.73 (2-hop) non-holiday; −5.46 and −0.18
+    holiday.
+- **All are below 0.004% of the ceiling.**
+
+**Diagnosis rule: where twins sit in the flags** (+1h, m = 1; twin cells
+are 11.4% of cells):
+
+| Set | Flags in twin cells | True positives in twin cells | Exceedances in twin cells | **Actual excess (units) in twin cells** | Flag precision: twin vs other cells |
+|---|---|---|---|---|---|
+| 24 downstream hours | 13.6% | 14.0% | 13.8% | **5.5%** | 0.712 vs 0.692 |
+| 311 non-holiday hours | 13.2% | 12.7% | 13.6% | **5.5%** | 0.621 vs 0.648 |
+
+**Hypothesis check: supported.** Twin cells carry about 13-14% of
+count-based quantities (flags, true positives, exceedances) but only 5.5%
+of the actual excess in activity units. So they weigh about 2.5× more in
+count-based claims (flag precision, F1) than in unit-based claims (net
+reduction).
+
+**De-duplicated neighbour fraction.**
+- **D1 (primary):** neighbours in the cell's own twin group are excluded,
+  because they are the same measurement. Each other twin group among the
+  neighbours counts as one unit, flagged if any member is flagged. The
+  denominator is the number of units. A cell with no remaining units gets
+  fraction 0 (ANOMALOUS); this affects 65 flags (24 hours) and 458 flags
+  (311 hours).
+- **D2 (sensitivity):** the cell's own-group neighbours also count as one
+  unit.
+- **Bootstrap:** hours as the unit, 5,000 resamples, seed 0, 90% intervals.
+
+| Set | Fraction | Definition | Precision ROUTINE / ANOMALOUS | Gap [90%] | Flags changing class |
+|---|---|---|---|---|---|
+| 24 hours | 0.3 | original | 0.718 / 0.529 | **+0.189** [+0.156, +0.220] | – |
+| 24 hours | 0.3 | D1 | 0.721 / 0.533 | **+0.188** [+0.168, +0.208] | 317 of 16,306 |
+| 24 hours | 0.3 | D2 | 0.720 / 0.526 | **+0.194** [+0.167, +0.220] | 159 |
+| 311 hours | 0.3 | original | 0.671 / 0.485 | **+0.186** [+0.167, +0.205] | – |
+| 311 hours | 0.3 | D1 | 0.675 / 0.485 | **+0.190** [+0.174, +0.207] | 2,584 of 119,113 |
+| 311 hours | 0.3 | D2 | 0.673 / 0.485 | **+0.188** [+0.170, +0.206] | 1,364 |
+| 24 / 311 hours | 0.2 | original → D1 | – | +0.210 → +0.198 / +0.205 → +0.207 | 174 / 1,426 |
+| 24 / 311 hours | 0.4 | original → D1 | – | +0.176 → +0.174 / +0.169 → +0.173 | 340 / 2,956 |
+
+**The gap does not shrink materially.** At 0.3 it moves by −0.001 to
++0.005 (24 hours) and +0.002 to +0.004 (311 hours), well inside the
+intervals. It stays significant at every fraction under both definitions.
+
+### What this means for the report's claims
+
+- **Solver claims** (V0 / B relief, B − V0, the 47.2% and 72.1% ceilings,
+  all under the one-for-one assumption):
+  - **Unaffected by the shared-coverage pairs this data can detect.**
+  - Moves between twin or proportional pairs are 0.0005-0.007% of the moved
+    amount; even the over-restrictive L999 bracket touches at most 0.12%.
+    Removing them changes net reduction by at most about 0.5% and leaves
+    both ceilings at 47.2% and 72.1%.
+  - **The reason:** moves happen where congestion is, in the dense centre,
+    and twins are in quiet outer cells.
+  - **This does not remove dataset limitation (a).** Partial sharing
+    between central squares, and the fact that square-to-square moves are
+    not physical capacity moves, remain unverified. The one-for-one
+    assumption still applies to every solver number.
+- **Diagnosis-rule claim** (ROUTINE vs ANOMALOUS precision):
+  - **Robust to counting each twin group once.** The gap stays at
+    0.188-0.194 vs 0.189 originally.
+  - Twins carry 13-14% of flags, so they could in principle have moved
+    count-based claims. They did not, because their flags behave like
+    other flags (precision 0.71 vs 0.69, and 0.62 vs 0.65).
+- **Count-based vs unit-based:** twin cells weigh more in count-based
+  measures (13-14%) than in unit-based ones (5.5%), as hypothesised. Even
+  so, neither kind of claim changes materially.
+
+### What this check does not show
+
+- **It rules out exact sharing for most pairs, not sharing in general.**
+  95.6% of neighbour pairs are not exact twins or proportional. But
+  partial sharing (squares split across the same coverage areas) cannot be
+  separated from real co-movement of neighbouring areas: ordinary
+  neighbours are highly correlated anyway (median correlation 0.961; 7.3%
+  at ≥ 0.9999).
+- **Even without any sharing, a square-to-square move is not a physical
+  capacity move.** The data are scaled record counts on a grid, not
+  base-station capacity. Every solver number still holds only under the
+  one-for-one activity-unit assumption.
+
+### What could not be verified
+
+- **The coverage-area geometry is not in the dataset.** So:
+  - full containment (exact twins) is the only sharing that can be proven;
+  - partial sharing cannot be separated from genuinely similar
+    neighbourhoods;
+  - the loose brackets (correlation ≥ 0.9999 / 0.999) are an
+    over-restrictive proxy, not a measurement.
+- **The twin test assumes equal-size squares** (the Milan grid's 235 m
+  squares). Unequal overlap with the same set of areas would show as
+  "proportional"; only 3 such pairs were found.
+- **The materiality threshold (10%) is arbitrary.** "Not material" holds
+  for the strict definition only, and is a lower bound.
+- **Grid orientation** (which grid row is north) was not verified. It
+  affects only the text map, not any count.
+- **The solver results cover 24 + 6 hours at +1h only**, as in Phases 3-4.
+
+Time: Stage 2 65 s; peak commit 3.3 GB. No model was fitted.
 
 ---
 
@@ -3008,3 +3264,175 @@ Confirmed from the headless run against the v2 API (`dash_v2.json`):
   "Forecast kind" column per row.
 
 No change was needed. The React front end was not touched.
+
+---
+
+## Scoring from raw activity (v2, one origin at a time)
+
+**This replays hours inside the 62-day dataset (Nov 1 2013 - Jan 1 2014).
+It is not live forecasting.**
+
+**Scripts:**
+- `src/forecasting/score_v2.py` (commands `install-models`, `score`);
+- the parity harness `src/evaluation/scoring_parity.py`.
+
+**Outputs:**
+- `data\processed\v2\scored\<origin>\`;
+- harness results and notes in `data\experiments\scoring\`.
+
+No model was fitted. Nothing in `data\raw`, the v1 database, the v1 parquet
+files, the API or any saved v2 output was changed.
+
+### Design
+
+- **One code path.** `score_origin(panel, models, origin)` is used by both
+  the command line and the parity harness. The harness loads the panel and
+  the models once.
+- **Information set.** Features at origin t use activity up to t-1 only;
+  hour t is never used. The lead time from the last observed hour is
+  therefore **h+1 hours (2, 3, 4, 5 hours for +1h to +4h)**.
+  `score_origin` slices the panel to hours before t before computing
+  anything. The rolling statistics use cumulative sums from the first hour
+  (Nov 1), exactly as the evaluation's feature store does, which is
+  required for bit-identical float32 features.
+- **Activity source.** Only `CellID`, `datetime` and `total_activity` are
+  read from `data\raw\cdr_with_congestion_flags.parquet`, through the
+  evaluation's own `load_panel`. No threshold or flag column of that file is
+  read; thresholds come only from `thresholds_v2`. Checked: the five-channel
+  sum in `cdr_activity_aggregated.parquet` is **bit-identical** to
+  `total_activity` on all 14,880,000 rows.
+- **Models.** The five files were **copied** (not moved) from
+  `data\experiments\phase2\models\` to `data\processed\v2\models\`, and
+  their SHA-256 hashes match the originals.
+
+  | Model | Trees | Leaves |
+  |---|---|---|
+  | `final_63l` +1h / +2h / +3h / +4h | 2,153 / 2,154 / 2,193 / 2,181 | 63 |
+  | `hotspot_only_final` +1h | 568 | 31 |
+
+  `models_manifest.json` records:
+  - LightGBM 4.7.0;
+  - the 23 features in model order, with `CellID` (index 8) categorical;
+  - float32 features;
+  - the target transform: log1p in training; prediction = clip(expm1, 0),
+    cast to float32;
+  - `cell_historical_mean`: `thresholds_v2.training_mean`, with the hash of
+    that file;
+  - the hotspot set (200 cell ids; top 2% by training mean, Nov 2 - Dec 9);
+  - the training period (targets Nov 2 - Dec 9; sizes chosen on Dec 10-16);
+  - the forecast_kind rules and the information-set convention.
+
+  Hashes are checked again every time the models are loaded.
+- **Rules.** Watch flags and diagnosis call `diagnosis_agent_v2.diagnose`.
+  The V0 solver at +1h calls `solver_v2.run`, which imports `solve_hour`
+  unchanged. Solver results hold only under the one-for-one activity-unit
+  assumption: moves between grid squares are not physical capacity moves.
+- **Outputs per origin:**
+  - `forecasts.parquet`, `watch_flags.parquet` and `diagnosis.parquet`;
+  - `solver_moves.parquet` and `coverage.parquet`;
+  - `manifest.json`: targets with their labels, input and model hashes,
+    LightGBM version, counts and timings.
+
+  The script refuses to overwrite an existing folder unless `--force` is
+  given.
+
+### Labelling rules (by target T = origin + h)
+
+These apply to the forecasts, watch flags, diagnosis and solver outputs
+alike.
+
+| Label | Rule | Meaning |
+|---|---|---|
+| `in-sample` | T before Dec 10 00:00 | A training target of the models. The thresholds (Nov 1 - Dec 9) and `cell_historical_mean` also use data after the origin (look-ahead). Not a measure of prediction quality. |
+| `validation` | Dec 10 00:00 ≤ T < Dec 17 00:00 | Used for model size and margin selection; out-of-training, but not an untouched test |
+| `unevaluated` | T ≥ Dec 17 00:00 from an origin before Dec 17 00:00 (targets Dec 17 00:00-03:00) | Between validation and test; no saved reference |
+| `test` | T from Dec 17 to Jan 1 23:00, origin ≥ Dec 17 00:00 | Not used for size or margins; used for feature-group selection in Phase 2 |
+| `forecast` | T after Jan 1 23:00 | Forecast only; no actuals available |
+
+- **Valid origins:** Nov 2 00:00 to Jan 2 00:00. Earlier origins are
+  rejected with a message (checked: Nov 1 23:00 is refused).
+- **Checked from the command line:** an origin on Dec 16 22:00 gives
+  validation, unevaluated, unevaluated, unevaluated. An origin on Jan 1
+  22:00 gives test, then forecast for the three later horizons.
+
+### Parity results
+
+**30 parity origins with a saved reference.**
+- **Validation (10):** Dec 10 02:00, Dec 10 08:00, Dec 11 12:00, Dec 12
+  17:00, Dec 13 20:00, Dec 14 11:00, Dec 15 15:00, Dec 15 19:00, Dec 16
+  07:00, Dec 16 19:00.
+- **Test (20):** 14 replay targets minus one hour (including Dec 25 and
+  Jan 1), plus Dec 17 00:00, Dec 24 10:00, Dec 27 15:00, Dec 31 22:00,
+  Jan 1 01:00 and Jan 1 19:00.
+- Every origin was checked at every horizon: 120 origin × horizon cases.
+
+| Check | Required | Result |
+|---|---|---|
+| Features vs `build_rows` on the full panel | bit-identical float32 | **identical in all 120 cases** |
+| Forecasts vs saved `cell_forecasts_v2` | bit-identical, at most 1 float32 ULP | **0 ULP (bit-identical)** in all 1,200,000 cell forecasts. 2 cells lie within a relative 1e-6 of their threshold; with no difference, no flag can flip. |
+| Flags (68,393), classification, reason text | 0 mismatches | **0 / 0 / 0** |
+| Watch flags | 0 mismatches | **0** |
+| V0 solver moves at +1h (14,731 moves) | 0 mismatches | **0 key mismatches; maximum amount difference 0.0** |
+| forecast_kind vs the saved v2 label | agree | **agree** |
+
+**6 weekly-boundary origins with no saved reference:** Nov 2 00:00 and
+Nov 7 20:00 to Nov 8 00:00, all in-sample.
+- **Features:** bit-identical to `build_rows`.
+- **Forecasts:** bit-identical (0 ULP) to the original evaluation path
+  (`phase2_common.predict` on `build_rows` features, same model files).
+- **The NaN handling matches training:**
+  - `lag_168h` is NaN for every cell until Nov 8 00:00;
+  - `weekly_naive` (A[t+h-168]) becomes available as t+h reaches Nov 8
+    00:00 (for example origin Nov 7 21:00: NaN at +1h and +2h, present at
+    +3h and +4h).
+
+**Further checks:**
+- **Leakage test** (extra): at two origins (Dec 13 20:00, Dec 29 14:00),
+  activity and neighbour means at every hour from the origin onward were
+  replaced with random values. All outputs (forecasts, diagnosis, watch
+  flags, solver moves) were **identical**. Scoring does not read hours at
+  or after the origin.
+- **Command line vs harness:** `score --origin "2013-12-18 11:00"` wrote
+  forecasts and solver moves (673) identical to the harness result. A
+  second run without `--force` was refused.
+- **Protected files:** v1 database SHA-256 (`2ee5f78f…5bed1`) and mtime
+  unchanged; `data\raw` file count (69), sizes and mtimes unchanged,
+  before and after.
+
+### Time and memory
+
+| Step | Time | Peak commit |
+|---|---|---|
+| Model copy and hash check (`install-models`, rerun with the copies in place) | 5.2 s | 1.3 GB |
+| Channel-sum bit-identity check (both parquet files, read-only) | 6.5 s | – |
+| Harness: load panel / feature store / models / saved v2 outputs | 10.5 / 4.4 / 5.0 / 1.7 s | 1.9 / 3.3 / 3.7 / 4.9 GB |
+| Harness: 30 parity origins (score + reference + comparisons) | 381 s (about 13 s per origin) | 5.3 GB |
+| Harness: 6 boundary origins / leakage test | 89 s / 25 s | 5.0 / 5.5 GB |
+| **Command line, one origin** | **about 30 s** (load panel 10-20 s, load models 5 s, score 5.5-7 s) | **about 2.7 GB** |
+
+Commit headroom before the harness was 5.9 GB. That is just under the 6 GB
+rule, which applies to model fits; no fit was run, and the harness peaked
+at 5.45 GB of commit.
+
+### What could not be verified
+
+- **Origins with no saved reference** are checked only for feature and
+  forecast identity with the evaluation path (the 6 boundary origins), not
+  for flags or solver moves against an independent source. This covers:
+  in-sample origins, the `unevaluated` targets, test targets from origins
+  Jan 1 20:00-22:00 (outside the saved v2 test set), and `forecast`
+  targets.
+- **Bit-identity depends on the environment:** LightGBM 4.7.0, numpy and
+  pandas as installed. Another library version, or computing the rolling
+  sums from a later start hour, could change the last float bits and, at
+  boundary splits, a forecast.
+- **The models and the panel come from the study's own files.** The model
+  files live under ignored folders (not in git). The panel is loaded in
+  full and truncated in memory; the leakage test shows that hours from the
+  origin onward are not used.
+- **Not live:** there is no live data feed, no handling of late or missing
+  hours beyond the loader's zero-fill, and no check on data after Jan 1.
+  `forecast`-labelled outputs cannot be evaluated.
+- **Look-ahead for in-sample origins:** these outputs use thresholds and
+  cell means computed with later data, so they must not be read as
+  prediction quality.
