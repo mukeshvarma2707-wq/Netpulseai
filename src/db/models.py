@@ -24,7 +24,7 @@ rewrite of this file or any query code.
 
 from datetime import datetime
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey, Index
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -32,6 +32,8 @@ Base = declarative_base()
 
 class DiagnosedCase(Base):
     __tablename__ = "diagnosed_cases"
+    # Covers GET /hours (per-hour counts by class) without a full table scan.
+    __table_args__ = (Index("ix_diagnosed_cases_dt_class", "target_datetime", "classification"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     cell_id = Column(Integer, nullable=False, index=True)

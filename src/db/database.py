@@ -24,6 +24,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # create_all only adds indexes when it creates a table, so add any that
+    # were introduced after the database was first built.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(bind=engine, checkfirst=True)
 
 
 def get_session():

@@ -86,7 +86,9 @@ if __name__ == "__main__":
             case = DiagnosedCase(
                 cell_id=int(row["CellID"]),
                 target_datetime=row["target_datetime_1h"],
-                naive_forecast=float(row.get("naive_forecast_1h", 0) or 0),
+                # diagnosis_agent.py now writes the LightGBM forecast as
+                # forecast_1h; older outputs used naive_forecast_1h.
+                naive_forecast=float(row.get("forecast_1h", row.get("naive_forecast_1h", 0)) or 0),
                 congestion_threshold=float(row.get("congestion_threshold", 0) or 0),
                 classification=row["classification"],
                 reason=row["reason"],
