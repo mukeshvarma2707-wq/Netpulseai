@@ -7,3 +7,7 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 .ipynb_checkpoints/
+# Study data, large outputs and local backups (not for version control)
+data/trentino/
+data/experiments/
+backup_initial/
