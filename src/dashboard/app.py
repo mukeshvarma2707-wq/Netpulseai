@@ -45,6 +45,16 @@ def trigger_report(case_id: int):
     return resp.json()
 
 
+def fetch_watch(limit: int):
+    """Advisory watch flags; only served when the API runs on the v2 database (BALANCEGRID_DB=v2).
+    Returns None against the v1 API, which has no /watch route."""
+    try:
+        resp = requests.get(f"{API_BASE}/watch", params={"limit": limit}, timeout=10)
+        return resp.json() if resp.status_code == 200 else None
+    except requests.exceptions.RequestException:
+        return None
+
+
 with st.sidebar:
     st.header("Settings")
     classification_filter = st.selectbox("Filter by classification", ["All", "ROUTINE", "ANOMALOUS"])
@@ -78,10 +88,21 @@ table_data = [
         "Covered": round(c["covered"], 1) if c["covered"] is not None else None,
         "Fully Resolved?": "Yes" if c["fully_resolved"] else ("No" if c["fully_resolved"] is not None else None),
         "Report?": "Yes" if c["has_report"] else "No",
+        **({"Forecast kind": c["forecast_kind"]} if "forecast_kind" in c else {}),
     }
     for c in cases
 ]
 st.dataframe(table_data, width="stretch")
+
+watch = fetch_watch(limit)
+if watch is not None:
+    st.subheader("Watch flags (advisory, +1h)")
+    prec = ", ".join(f"{k} {v:.0%}" for k, v in watch["watch_precision"].items() if v is not None)
+    st.caption(f"{watch['note']}. {watch['definition']} (margin {watch['margin']}). "
+               f"Measured share that actually exceeded: {prec}. Showing {len(watch['items'])} of {watch['total']:,}.")
+    st.dataframe([{"Cell": w["cell_id"], "Target Time": w["target_datetime"], "Forecast": round(w["forecast"], 1),
+                   "Threshold": round(w["threshold"], 1), "Forecast kind": w["forecast_kind"], "Status": "advisory"}
+                  for w in watch["items"]], width="stretch")
 
 case_options = {f"Cell {c['cell_id']} @ {c['target_datetime']} (id {c['id']})": c["id"] for c in cases}
 selected_label = st.selectbox("Select a case for details", list(case_options.keys()))
@@ -94,6 +115,8 @@ st.subheader(f"Case Detail - Cell {detail['cell_id']} @ {detail['target_datetime
 badge_color = "orange" if detail["classification"] == "ROUTINE" else "red"
 st.markdown(f"**Classification:** :{badge_color}[{detail['classification']}]")
 st.write(f"**Reason:** {detail['reason']}")
+if "forecast_kind" in detail:
+    st.caption(f"Forecast kind: {detail.get('forecast_kind_label') or detail['forecast_kind']}")
 
 col1, col2 = st.columns(2)
 col1.metric("Forecasted Load", f"{detail['naive_forecast']:.1f}")
